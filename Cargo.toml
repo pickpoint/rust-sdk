@@ -1,0 +1,50 @@
+[package]
+name = "pickpoint"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Official Rust SDK for Pickpoint — geocoding, routing, devices, and realtime tracking"
+license = "Apache-2.0"
+repository = "https://github.com/pickpoint/rust-sdk"
+homepage = "https://pickpoint.io"
+documentation = "https://docs.rs/pickpoint"
+readme = "README.md"
+keywords = ["geocoding", "routing", "tracking", "maps", "gps"]
+categories = ["api-bindings", "network-programming"]
+exclude = [".idea/", ".github/"]
+
+[dependencies]
+base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
+http = "1"
+prost = "0.13"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tonic = { version = "0.12", features = ["transport"] }
+tower = "0.5"
+url = "2"
+urlencoding = "2"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+axum = "0.7"
+futures-util = "0.3"
+hex = "0.4"
+httpmock = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
