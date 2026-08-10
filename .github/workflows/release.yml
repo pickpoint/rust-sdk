@@ -18,7 +18,7 @@ jobs:
   # NOTE: pushes made with GITHUB_TOKEN do not trigger new workflows, so we
   # must publish in this same job (cannot rely on the tag push event).
   release-main:
-    if: github.ref == "refs/heads/main"
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -112,7 +112,7 @@ jobs:
   # Manual tags (human push). GITHUB_TOKEN tag pushes from release-main do not
   # reach here — that path publishes above.
   publish-tag:
-    if: startsWith(github.ref, "refs/tags/v")
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
