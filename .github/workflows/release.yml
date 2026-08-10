@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # Auto-patch on main when HEAD is not already tagged.
+  # NOTE: pushes made with GITHUB_TOKEN do not trigger new workflows, so we
+  # must publish in this same job (cannot rely on the tag push event).
+  release-main:
+    if: github.ref == "refs/heads/main"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip if release commit or already tagged
+        id: guard
+        run: |
+          msg=$(git log -1 --pretty=%B)
+          if echo "$msg" | grep -q '\[skip release\]'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: commit has [skip release]"
+            exit 0
+          fi
+          if git describe --exact-match --tags HEAD 2>/dev/null | grep -q '^v'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Skipping: HEAD already tagged"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.guard.outputs.skip != 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.guard.outputs.skip != 'true'
+
+      - if: steps.guard.outputs.skip != 'true'
+        run: cargo test
+
+      - name: Bump patch, commit, tag
+        if: steps.guard.outputs.skip != 'true'
+        id: bump
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          ver=$(python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("Cargo.toml")
+          text = path.read_text()
+          # Only bump package.version in the root [package] table.
+          m = re.search(r'(?m)^version = "(\d+)\.(\d+)\.(\d+)"', text)
+          if not m:
+              raise SystemExit("version not found in Cargo.toml")
+          major, minor, patch = map(int, m.groups())
+          new = f"{major}.{minor}.{patch + 1}"
+          text = re.sub(
+              r'(?m)^version = "\d+\.\d+\.\d+"',
+              f'version = "{new}"',
+              text,
+              count=1,
+          )
+          path.write_text(text)
+          print(new)
+          PY
+          )
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          git add Cargo.toml
+          git commit -m "chore: release v${ver} [skip release]"
+          git tag "v${ver}"
+          git push origin HEAD:main --follow-tags
+
+      - name: Auth to crates.io (OIDC)
+        if: steps.guard.outputs.skip != 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        if: steps.guard.outputs.skip != 'true'
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: GitHub Release
+        if: steps.guard.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.bump.outputs.version }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Manual tags (human push). GITHUB_TOKEN tag pushes from release-main do not
+  # reach here — that path publishes above.
+  publish-tag:
+    if: startsWith(github.ref, "refs/tags/v")
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches Cargo.toml
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(python3 -c 'import re; t=open("Cargo.toml").read(); print(re.search(r"(?m)^version = \"([^\"]+)\"", t).group(1))')
+          if [ "$tag" != "$ver" ]; then
+            echo "Tag v$tag != Cargo.toml version $ver"
+            exit 1
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+      - name: Skip if version already on crates.io
+        id: exists
+        run: |
+          ver=$(python3 -c 'import re; t=open("Cargo.toml").read(); print(re.search(r"(?m)^version = \"([^\"]+)\"", t).group(1))')
+          if curl -sf "https://crates.io/api/v1/crates/pickpoint/${ver}" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Version $ver already published — skip cargo publish"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Auth to crates.io (OIDC)
+        if: steps.exists.outputs.exists != 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        if: steps.exists.outputs.exists != 'true'
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

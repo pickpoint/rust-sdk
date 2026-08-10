@@ -260,6 +260,22 @@ PICKPOINT_API_KEY=… cargo test --test e2e_geocode_batch -- --nocapture
 # optional: PICKPOINT_BASE_URL=https://api.pickpoint.io  (default: https://beta-api.pickpoint.io)
 ```
 
+### CI & release
+
+- **PR** → `.github/workflows/ci.yml` (`fmt`, `clippy`, `test`)
+- **Push to `main`** (untagged HEAD) → bump **patch** in `Cargo.toml`, tag `vX.Y.Z`, `cargo publish` (OIDC) + GitHub Release in the same job  
+  (tag push via `GITHUB_TOKEN` does not start new workflows — publish cannot wait on the tag event)
+- **Manual tag `v*`** (pushed by a human) → publish + GitHub Release
+
+Minor/major: bump `version` in `Cargo.toml` in a PR, merge with `[skip release]` in the commit message, then:
+
+```bash
+git tag v2.1.0
+git push origin v2.1.0
+```
+
+crates.io Trusted Publishing must match this workflow: repo `rust-sdk`, workflow `release.yml` (leave Environment empty).
+
 Protobuf stubs under `src/tracking/v2` are generated from [`pickpoint-proto`](https://github.com/pickpoint/pickpoint-proto) by `build.rs` when the sibling checkout is present; otherwise committed stubs are used. Regenerate:
 
 ```bash
