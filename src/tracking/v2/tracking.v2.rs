@@ -219,10 +219,9 @@ pub struct Subscribed {
     pub track_uid: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
     pub last_location: ::core::option::Option<LatLng>,
+    /// Planned route (if any). Live trail is LocationAdded only — not a full history dump.
     #[prost(message, repeated, tag = "4")]
     pub route: ::prost::alloc::vec::Vec<LatLng>,
-    #[prost(message, repeated, tag = "5")]
-    pub locations: ::prost::alloc::vec::Vec<LatLng>,
     #[prost(double, tag = "6")]
     pub estimated_distance: f64,
     #[prost(double, tag = "7")]
