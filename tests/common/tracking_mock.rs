@@ -288,7 +288,6 @@ async fn handle_conn(stream: TcpStream, conns: Arc<Mutex<Vec<MockConn>>>, opts: 
                         track_uid: "track-mock-1".into(),
                         last_location: None,
                         route: Vec::new(),
-                        locations: Vec::new(),
                         estimated_distance: 0.0,
                         estimated_duration: 0.0,
                         start_location_name: String::new(),
