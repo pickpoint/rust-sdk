@@ -1,14 +1,12 @@
 use std::time::{Duration, Instant};
 
-use pickpoint::tracking::v2::LatLng;
-use pickpoint::tracking::v2::{client_msg, server_msg, ClientMsg, Hello, ServerMsg};
 use pickpoint::tracking::{
-    build_ws_url, can_accept_publish, client_resume, decode_server_msg, encode_client_msg,
-    new_backoff, next_delay, next_publish_allowed_at, reset_backoff, stamp_lat_lng, Config,
-    DeviceAuth, ListenerAuth, OfflineQueue, MAX_PUBLISH_HZ, MIN_PUBLISH_INTERVAL,
+    build_ws_url, can_accept_publish, client_resume, decode_client_cmd, decode_server_msg,
+    encode_client_cmd, encode_loc_frames, encode_server_evt, new_backoff, next_delay,
+    next_publish_allowed_at, reset_backoff, stamp_lat_lng, ClientCmd, Config, DeviceAuth, LatLng,
+    ListenerAuth, OfflineQueue, ServerEvt, MAX_PUBLISH_HZ, MIN_PUBLISH_INTERVAL,
     MIN_PUBLISH_INTERVAL_MS,
 };
-use prost::Message;
 
 #[test]
 fn backoff_full_jitter() {
@@ -56,14 +54,14 @@ fn offline_queue_ack_through() {
 }
 
 #[test]
-fn offline_queue_drop_oldest() {
+fn offline_queue_keep_newest_on_overflow() {
     let mut q = OfflineQueue::new(2);
     let p = LatLng {
         latitude: 1.0,
         ..Default::default()
     };
-    assert_eq!(q.enqueue(1, p), 0);
-    assert_eq!(q.enqueue(2, p), 0);
+    assert_eq!(q.enqueue(1, p.clone()), 0);
+    assert_eq!(q.enqueue(2, p.clone()), 0);
     assert_eq!(q.enqueue(3, p), 1);
     let got = q.peek_all();
     assert_eq!(got.len(), 2);
@@ -117,7 +115,7 @@ fn build_ws_url_device() {
     })
     .unwrap();
     assert_eq!(u.scheme(), "wss");
-    assert_eq!(u.path(), "/v2/tracking/ws");
+    assert_eq!(u.path(), "/v2/ws");
     let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
     assert_eq!(q.get("client-id").map(String::as_str), Some("id"));
     assert_eq!(q.get("client-secret").map(String::as_str), Some("sec"));
@@ -169,13 +167,16 @@ fn stamp_lat_lng_preserves_timestamp() {
 
 #[test]
 fn codec_round_trip_resume() {
-    let msg = client_resume("t1", 9);
-    let b = encode_client_msg(&msg).unwrap();
-    let round = ClientMsg::decode(&b[..]).unwrap();
-    match round.body {
-        Some(client_msg::Body::Resume(r)) => {
-            assert_eq!(r.track_uid, "t1");
-            assert_eq!(r.last_client_seq, 9);
+    let msg = client_resume("00112233-4455-6677-8899-aabbccddeeff", 9);
+    let b = encode_client_cmd(&msg);
+    let round = decode_client_cmd(&b).unwrap();
+    match round {
+        ClientCmd::Resume {
+            track_uid,
+            last_client_seq,
+        } => {
+            assert_eq!(track_uid, "00112233-4455-6677-8899-aabbccddeeff");
+            assert_eq!(last_client_seq, 9);
         }
         other => panic!("{other:?}"),
     }
@@ -183,27 +184,61 @@ fn codec_round_trip_resume() {
 
 #[test]
 fn codec_round_trip_hello() {
-    let msg = ServerMsg {
-        body: Some(server_msg::Body::Hello(Hello {
-            node_id: "n1".into(),
-            shard: 7,
-        })),
+    let msg = ServerEvt::Hello {
+        version: 2,
+        node_id: "33333333-3333-3333-3333-333333333333".into(),
+        shard: 7,
     };
-    let b = prost::Message::encode_to_vec(&msg);
+    let b = encode_server_evt(&msg);
     let got = decode_server_msg(&b).unwrap();
-    match got.body {
-        Some(server_msg::Body::Hello(h)) => {
-            assert_eq!(h.node_id, "n1");
-            assert_eq!(h.shard, 7);
+    match got {
+        ServerEvt::Hello {
+            version,
+            node_id,
+            shard,
+        } => {
+            assert_eq!(version, 2);
+            assert_eq!(node_id, "33333333-3333-3333-3333-333333333333");
+            assert_eq!(shard, 7);
         }
         other => panic!("{other:?}"),
     }
 }
 
 #[test]
-fn golden_resume_wire() {
-    let msg = client_resume("track-uid-9", 42);
-    let b = encode_client_msg(&msg).unwrap();
-    let got = hex::encode(&b);
-    assert_eq!(got, "0a0f0a0b747261636b2d7569642d39102a");
+fn golden_frames() {
+    let ack = encode_server_evt(&ServerEvt::Ack { seq: 1 });
+    assert_eq!(hex::encode(&ack), "8501000000");
+
+    let loc = encode_client_cmd(&ClientCmd::LocationAdd {
+        track_uid: String::new(),
+        client_seq: 1,
+        point: LatLng::new(55.0, 37.0),
+    });
+    assert_eq!(hex::encode(&loc), "04010000000100c03b470340933402");
+
+    let resume = encode_client_cmd(&client_resume(
+        "00112233-4455-6677-8899-aabbccddeeff",
+        45,
+    ));
+    assert_eq!(
+        hex::encode(&resume),
+        "0100112233445566778899aabbccddeeff2d000000"
+    );
+}
+
+#[test]
+fn encode_loc_frames_splits_on_i16_overflow() {
+    let a = LatLng::new(55.0, 37.0);
+    let b = LatLng::new(55.05, 37.0); // 50_000 μ° > i16::MAX
+    let frames = encode_loc_frames(2, &[a, b]);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0][0], 0x04);
+    assert_eq!(frames[1][0], 0x04);
+}
+
+#[test]
+fn non_uuid_encodes_as_nil() {
+    let b = encode_client_cmd(&client_resume("not-a-uuid", 1));
+    assert_eq!(&b[1..17], &[0u8; 16]);
 }

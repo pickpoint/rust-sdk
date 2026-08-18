@@ -3,9 +3,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::tracking_mock::{server_error, MockOpts, MockServer};
-use pickpoint::tracking::v2::{client_msg, ErrorCode, LatLng, Relocate};
-use pickpoint::tracking::{connect, Config, ConnectionState, DeviceAuth};
+use common::tracking_mock::{server_error, MockOpts, MockServer, MOCK_TRACK_UID};
+use pickpoint::tracking::{
+    connect, ClientCmd, Config, ConnectionState, DeviceAuth, ErrorCode, LatLng, Relocate, ServerEvt,
+};
 
 #[tokio::test]
 async fn reconnect_sends_resume_not_track_start() {
@@ -44,13 +45,17 @@ async fn reconnect_sends_resume_not_track_start() {
 
     let resume = ms
         .wait_msg(
-            |m| matches!(m.body, Some(client_msg::Body::Resume(_))),
+            |m| matches!(m, ClientCmd::Resume { .. }),
             Duration::from_secs(8),
         )
         .await;
-    if let Some(client_msg::Body::Resume(r)) = resume.body {
-        assert_eq!(r.track_uid, uid);
-        assert_eq!(r.last_client_seq, 2);
+    if let ClientCmd::Resume {
+        track_uid,
+        last_client_seq,
+    } = resume
+    {
+        assert_eq!(track_uid, uid);
+        assert_eq!(last_client_seq, 2);
     } else {
         panic!("expected resume");
     }
@@ -58,7 +63,7 @@ async fn reconnect_sends_resume_not_track_start() {
     let msgs = ms.all_messages().await;
     let starts = msgs
         .iter()
-        .filter(|m| matches!(m.body, Some(client_msg::Body::TrackStart(_))))
+        .filter(|m| matches!(m, ClientCmd::TrackStart { .. }))
         .count();
     assert_eq!(starts, 1);
 
@@ -78,19 +83,15 @@ async fn reconnect_track_not_found_clears_cursor() {
     let on_msg: common::tracking_mock::OnMsg = Arc::new(|msg, conn| {
         let conn = conn.clone();
         tokio::spawn(async move {
-            match msg.body {
-                Some(client_msg::Body::TrackStart(_)) => {
-                    conn.send(&pickpoint::tracking::v2::ServerMsg {
-                        body: Some(pickpoint::tracking::v2::server_msg::Body::TrackStarted(
-                            pickpoint::tracking::v2::TrackStarted {
-                                track_uid: "t-gone".into(),
-                                metadata: Vec::new(),
-                            },
-                        )),
+            match msg {
+                ClientCmd::TrackStart { .. } => {
+                    conn.send(&ServerEvt::TrackStarted {
+                        track_uid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                        metadata: Vec::new(),
                     })
                     .await;
                 }
-                Some(client_msg::Body::Resume(_)) => {
+                ClientCmd::Resume { .. } => {
                     conn.send(&server_error(ErrorCode::TrackNotFound, "track expired"))
                         .await;
                 }
@@ -119,13 +120,16 @@ async fn reconnect_track_not_found_clears_cursor() {
     .unwrap();
 
     c.start_track(None, vec![]).await.unwrap();
-    assert_eq!(c.track_uid().await, "t-gone");
+    assert_eq!(
+        c.track_uid().await,
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    );
 
     let conn = ms.wait_conn(Duration::from_secs(2)).await;
     conn.close().await;
 
     ms.wait_msg(
-        |m| matches!(m.body, Some(client_msg::Body::Resume(_))),
+        |m| matches!(m, ClientCmd::Resume { .. }),
         Duration::from_secs(8),
     )
     .await;
@@ -169,7 +173,7 @@ async fn relocate_dials_new_endpoint() {
     assert_eq!(c.state().await, ConnectionState::Open);
     assert!(target.conn_count().await >= 1);
     let uid = c.start_track(None, vec![]).await.unwrap();
-    assert_eq!(uid, "track-mock-1");
+    assert_eq!(uid, MOCK_TRACK_UID);
     c.close().await.unwrap();
 }
 
@@ -228,7 +232,8 @@ async fn queue_flush_after_resume() {
         })
         .await;
     assert!(ok);
-    assert_eq!(seq, 1);
+    // Seq is assigned when leaving Staging, not while the socket is down.
+    assert_eq!(seq, 0);
 
     {
         let (lock, cvar) = &*pair;
@@ -238,17 +243,12 @@ async fn queue_flush_after_resume() {
     }
 
     ms.wait_msg(
-        |m| matches!(m.body, Some(client_msg::Body::Resume(_))),
+        |m| matches!(m, ClientCmd::Resume { .. }),
         Duration::from_secs(8),
     )
     .await;
     ms.wait_msg(
-        |m| {
-            matches!(
-                m.body,
-                Some(client_msg::Body::LocationBatch(_)) | Some(client_msg::Body::LocationAdd(_))
-            )
-        },
+        |m| matches!(m, ClientCmd::LocationBatch { .. } | ClientCmd::LocationAdd { .. }),
         Duration::from_secs(8),
     )
     .await;

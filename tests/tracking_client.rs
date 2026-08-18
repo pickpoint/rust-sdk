@@ -4,11 +4,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::tracking_mock::{server_error, MockOpts, MockServer};
-use pickpoint::tracking::v2::{client_msg, server_msg, ErrorCode, LatLng, LocationAdded};
+use common::tracking_mock::{server_error, MockOpts, MockServer, MOCK_DEVICE_UID};
 use pickpoint::tracking::{
-    connect, Config, ConnectionState, DeviceAuth, ListenerAuth, MAX_EVENT_BYTES, MAX_PUBLISH_HZ,
-    MIN_PUBLISH_INTERVAL,
+    connect, ClientCmd, Config, ConnectionState, DeviceAuth, ErrorCode, LatLng, ListenerAuth,
+    ServerEvt, MAX_EVENT_BYTES, MAX_PUBLISH_HZ, MIN_PUBLISH_INTERVAL,
 };
 
 #[tokio::test]
@@ -128,16 +127,17 @@ async fn resume_after_publish() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
-        let msg = c.recv().await.unwrap();
-        if matches!(msg.body, Some(server_msg::Body::LocationAdded(_))) {
+        if c.last_acked_seq().await >= 1 {
             break;
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert_eq!(c.last_acked_seq().await, 1);
 
     let acked = c.resume(uid, 1).await.unwrap();
     assert_eq!(acked, 0);
     ms.wait_msg(
-        |m| matches!(m.body, Some(client_msg::Body::Resume(_))),
+        |m| matches!(m, ClientCmd::Resume { .. }),
         Duration::from_secs(2),
     )
     .await;
@@ -147,21 +147,19 @@ async fn resume_after_publish() {
 #[tokio::test]
 async fn listener_subscribe_and_location() {
     let on_msg: common::tracking_mock::OnMsg = Arc::new(|msg, conn| {
-        if let Some(client_msg::Body::Subscribe(sub)) = msg.body {
-            let device_uid = sub.device_uid;
+        if let ClientCmd::Subscribe { device_uid, .. } = msg {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                conn.send(&pickpoint::tracking::v2::ServerMsg {
-                    body: Some(server_msg::Body::LocationAdded(LocationAdded {
-                        device_uid,
-                        track_uid: "t1".into(),
-                        client_seq: 3,
-                        point: Some(LatLng {
-                            latitude: 1.5,
-                            longitude: 2.5,
-                            ..Default::default()
-                        }),
-                    })),
+                conn.send(&ServerEvt::LocationAdded {
+                    device_uid: device_uid.clone(),
+                    track_uid: "11111111-1111-1111-1111-111111111111".into(),
+                    client_seq: 3,
+                    sub: 1,
+                    point: LatLng {
+                        latitude: 1.5,
+                        longitude: 2.5,
+                        ..Default::default()
+                    },
                 })
                 .await;
             });
@@ -179,18 +177,18 @@ async fn listener_subscribe_and_location() {
     .await
     .unwrap();
 
-    c.subscribe("device-1").await.unwrap();
+    c.subscribe(MOCK_DEVICE_UID).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         let msg = c.recv().await.unwrap();
-        match msg.body {
-            Some(server_msg::Body::LocationAdded(loc)) => {
-                assert_eq!(loc.point.unwrap().latitude, 1.5);
+        match msg {
+            ServerEvt::LocationAdded { point, .. } => {
+                assert_eq!(point.latitude, 1.5);
                 c.close().await.unwrap();
                 return;
             }
-            Some(server_msg::Body::Subscribed(_)) => continue,
+            ServerEvt::Subscribed { .. } => continue,
             _ => {}
         }
     }
@@ -200,7 +198,7 @@ async fn listener_subscribe_and_location() {
 #[tokio::test]
 async fn auth_error_without_refresh_closes() {
     let on_msg: common::tracking_mock::OnMsg = Arc::new(|msg, conn| {
-        if matches!(msg.body, Some(client_msg::Body::TrackStart(_))) {
+        if matches!(msg, ClientCmd::TrackStart { .. }) {
             let conn = conn.clone();
             tokio::spawn(async move {
                 conn.send(&server_error(ErrorCode::Auth, "bad creds")).await;
@@ -252,7 +250,7 @@ async fn auth_error_refresh_redials() {
         hellos2.fetch_add(1, Ordering::SeqCst);
     });
     let on_msg: common::tracking_mock::OnMsg = Arc::new(|msg, conn| {
-        if matches!(msg.body, Some(client_msg::Body::TrackStart(_))) {
+        if matches!(msg, ClientCmd::TrackStart { .. }) {
             let conn = conn.clone();
             tokio::spawn(async move {
                 conn.send(&server_error(ErrorCode::Unauthorized, "expired"))
@@ -315,4 +313,34 @@ async fn auth_error_refresh_redials() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("expected second hello after refresh");
+}
+
+#[tokio::test]
+async fn publish_starts_track_and_close_stops() {
+    let ms = MockServer::start(true, None).await;
+    let c = connect(Config {
+        endpoint: ms.url.clone(),
+        device: Some(DeviceAuth {
+            client_id: "c".into(),
+            client_secret: "s".into(),
+        }),
+        disable_reconnect: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    c.publish(LatLng::new(55.75, 37.61)).await;
+    ms.wait_msg(|m| matches!(m, ClientCmd::TrackStart { .. }), Duration::from_secs(2))
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while c.track_uid().await.is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "track_uid after auto-start");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    c.close().await.unwrap();
+    ms.wait_msg(|m| matches!(m, ClientCmd::TrackStop { .. }), Duration::from_secs(2))
+        .await;
 }

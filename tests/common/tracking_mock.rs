@@ -1,21 +1,22 @@
-//! Mock tracking WebSocket server (Go `mock_server_test.go` parity).
+//! Mock tracking WebSocket server (binary `tracking.v2` frames).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use pickpoint::tracking::v2::{
-    client_msg, server_msg, ClientMsg, Error as WireError, ErrorCode, Hello, LocationAdded,
-    Relocate, ResumeOk, ServerMsg, Subscribed, TrackStarted, TrackStopped,
+use pickpoint::tracking::{
+    decode_client_cmd, encode_server_evt, ClientCmd, Relocate, ServerEvt, SUBPROTOCOL,
 };
-use pickpoint::tracking::SUBPROTOCOL;
-use prost::Message;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{accept_hdr_async, tungstenite::handshake::server::Request as WsRequest};
 
-pub type OnMsg = Arc<dyn Fn(ClientMsg, MockConn) + Send + Sync>;
+pub const MOCK_TRACK_UID: &str = "11111111-1111-1111-1111-111111111111";
+pub const MOCK_DEVICE_UID: &str = "22222222-2222-2222-2222-222222222222";
+pub const MOCK_NODE_ID: &str = "33333333-3333-3333-3333-333333333333";
+
+pub type OnMsg = Arc<dyn Fn(ClientCmd, MockConn) + Send + Sync>;
 pub type BeforeHello = Arc<dyn Fn(usize, MockConn) + Send + Sync>;
 
 #[derive(Clone, Default)]
@@ -32,15 +33,15 @@ pub struct MockConn {
 }
 
 struct MockConnInner {
-    messages: Vec<ClientMsg>,
+    messages: Vec<ClientCmd>,
     write: Option<
         futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, WsMessage>,
     >,
 }
 
 impl MockConn {
-    pub async fn send(&self, msg: &ServerMsg) {
-        let buf = msg.encode_to_vec();
+    pub async fn send(&self, msg: &ServerEvt) {
+        let buf = encode_server_evt(msg);
         let mut g = self.inner.lock().await;
         if let Some(w) = g.write.as_mut() {
             let _ = w.send(WsMessage::Binary(buf.into())).await;
@@ -54,7 +55,7 @@ impl MockConn {
         }
     }
 
-    pub async fn messages(&self) -> Vec<ClientMsg> {
+    pub async fn messages(&self) -> Vec<ClientCmd> {
         self.inner.lock().await.messages.clone()
     }
 }
@@ -116,9 +117,9 @@ impl MockServer {
         self.connections.lock().await.len()
     }
 
-    pub async fn wait_msg<F>(&self, mut pred: F, timeout: Duration) -> ClientMsg
+    pub async fn wait_msg<F>(&self, mut pred: F, timeout: Duration) -> ClientCmd
     where
-        F: FnMut(&ClientMsg) -> bool,
+        F: FnMut(&ClientCmd) -> bool,
     {
         let deadline = tokio::time::Instant::now() + timeout;
         while tokio::time::Instant::now() < deadline {
@@ -137,13 +138,21 @@ impl MockServer {
         panic!("wait_msg timeout");
     }
 
-    pub async fn all_messages(&self) -> Vec<ClientMsg> {
+    pub async fn all_messages(&self) -> Vec<ClientCmd> {
         let g = self.connections.lock().await;
         let mut out = Vec::new();
         for c in g.iter() {
             out.extend(c.messages().await);
         }
         out
+    }
+}
+
+fn hello_evt() -> ServerEvt {
+    ServerEvt::Hello {
+        version: 2,
+        node_id: MOCK_NODE_ID.into(),
+        shard: 0,
     }
 }
 
@@ -192,34 +201,23 @@ async fn handle_conn(stream: TcpStream, conns: Arc<Mutex<Vec<MockConn>>>, opts: 
 
     if let Some(rel) = &opts.relocate_on_connect {
         if idx == 1 {
-            conn.send(&ServerMsg {
-                body: Some(server_msg::Body::Relocate(rel.clone())),
+            conn.send(&ServerEvt::Relocate {
+                endpoint: rel.endpoint.clone(),
+                retry_after_ms: rel.retry_after_ms,
             })
             .await;
         } else {
-            conn.send(&ServerMsg {
-                body: Some(server_msg::Body::Hello(Hello {
-                    node_id: "mock-1".into(),
-                    shard: 0,
-                })),
-            })
-            .await;
+            conn.send(&hello_evt()).await;
         }
     } else {
-        conn.send(&ServerMsg {
-            body: Some(server_msg::Body::Hello(Hello {
-                node_id: "mock-1".into(),
-                shard: 0,
-            })),
-        })
-        .await;
+        conn.send(&hello_evt()).await;
     }
 
     while let Some(frame) = read.next().await {
         let Ok(WsMessage::Binary(b)) = frame else {
             break;
         };
-        let Ok(msg) = ClientMsg::decode(&b[..]) else {
+        let Ok(msg) = decode_client_cmd(&b) else {
             continue;
         };
         {
@@ -232,76 +230,51 @@ async fn handle_conn(stream: TcpStream, conns: Arc<Mutex<Vec<MockConn>>>, opts: 
         if !opts.auto {
             continue;
         }
-        match msg.body {
-            Some(client_msg::Body::TrackStart(_)) => {
-                conn.send(&ServerMsg {
-                    body: Some(server_msg::Body::TrackStarted(TrackStarted {
-                        track_uid: "track-mock-1".into(),
-                        metadata: Vec::new(),
-                    })),
+        match msg {
+            ClientCmd::TrackStart { .. } => {
+                conn.send(&ServerEvt::TrackStarted {
+                    track_uid: MOCK_TRACK_UID.into(),
+                    metadata: Vec::new(),
                 })
                 .await;
             }
-            Some(client_msg::Body::TrackStop(s)) => {
-                conn.send(&ServerMsg {
-                    body: Some(server_msg::Body::TrackStopped(TrackStopped {
-                        track_uid: s.track_uid,
-                    })),
+            ClientCmd::TrackStop { track_uid } => {
+                conn.send(&ServerEvt::TrackStopped {
+                    track_uid: if track_uid.is_empty() {
+                        MOCK_TRACK_UID.into()
+                    } else {
+                        track_uid
+                    },
                 })
                 .await;
             }
-            Some(client_msg::Body::Resume(r)) => {
-                conn.send(&ServerMsg {
-                    body: Some(server_msg::Body::ResumeOk(ResumeOk {
-                        track_uid: r.track_uid,
-                        last_acked_seq: 0,
-                    })),
+            ClientCmd::Resume { track_uid, .. } => {
+                conn.send(&ServerEvt::ResumeOk {
+                    track_uid,
+                    last_acked_seq: 0,
                 })
                 .await;
             }
-            Some(client_msg::Body::LocationAdd(a)) => {
-                conn.send(&ServerMsg {
-                    body: Some(server_msg::Body::LocationAdded(LocationAdded {
-                        track_uid: a.track_uid,
-                        client_seq: a.client_seq,
-                        point: a.point,
-                        device_uid: "dev-1".into(),
-                    })),
-                })
-                .await;
+            ClientCmd::LocationAdd { client_seq, .. } => {
+                conn.send(&ServerEvt::Ack { seq: client_seq }).await;
             }
-            Some(client_msg::Body::LocationBatch(b)) => {
-                conn.send(&ServerMsg {
-                    body: Some(server_msg::Body::LocationAdded(LocationAdded {
-                        track_uid: b.track_uid,
-                        client_seq: b.client_seq,
-                        point: None,
-                        device_uid: "dev-1".into(),
-                    })),
-                })
-                .await;
+            ClientCmd::LocationBatch { client_seq, .. } => {
+                conn.send(&ServerEvt::Ack { seq: client_seq }).await;
             }
-            Some(client_msg::Body::Subscribe(s)) => {
-                conn.send(&ServerMsg {
-                    body: Some(server_msg::Body::Subscribed(Subscribed {
-                        device_uid: s.device_uid,
-                        track_uid: "track-mock-1".into(),
-                        last_location: None,
-                        route: Vec::new(),
-                        estimated_distance: 0.0,
-                        estimated_duration: 0.0,
-                        start_location_name: String::new(),
-                        end_location_name: String::new(),
-                        metadata: Vec::new(),
-                        online: false,
-                        last_seen_ms: None,
-                    })),
-                })
-                .await;
-            }
-            Some(client_msg::Body::Ping(_)) => {
-                conn.send(&ServerMsg {
-                    body: Some(server_msg::Body::Pong(Default::default())),
+            ClientCmd::Subscribe { device_uid, .. } => {
+                conn.send(&ServerEvt::Subscribed {
+                    sub: 1,
+                    device_uid,
+                    track_uid: MOCK_TRACK_UID.into(),
+                    last_location: None,
+                    route: Vec::new(),
+                    estimated_distance: 0.0,
+                    estimated_duration: 0.0,
+                    start_location_name: String::new(),
+                    end_location_name: String::new(),
+                    metadata: Vec::new(),
+                    online: false,
+                    last_seen_ms: None,
                 })
                 .await;
             }
@@ -310,14 +283,12 @@ async fn handle_conn(stream: TcpStream, conns: Arc<Mutex<Vec<MockConn>>>, opts: 
     }
 }
 
-pub fn server_error(code: ErrorCode, message: &str) -> ServerMsg {
-    ServerMsg {
-        body: Some(server_msg::Body::Error(WireError {
-            code: code as i32,
-            message: message.into(),
-            track_uid: None,
-            retry_after_ms: None,
-        })),
+pub fn server_error(code: pickpoint::tracking::ErrorCode, message: &str) -> ServerEvt {
+    ServerEvt::Error {
+        code,
+        message: message.into(),
+        track_uid: None,
+        retry_after_ms: None,
     }
 }
 

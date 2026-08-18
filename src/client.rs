@@ -20,7 +20,7 @@ use crate::transport::{trim_slash, Transport};
 
 /// Unified public-api client (geocoding, address, routing, devices).
 ///
-/// Tracking (WebSocket / gRPC) lives in [`crate::tracking`].
+/// Tracking (binary WebSocket, `tracking.v2`) lives in [`crate::tracking`].
 #[derive(Clone)]
 pub struct Client {
     transport: Arc<Transport>,

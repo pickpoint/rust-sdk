@@ -1,7 +1,7 @@
 //! Official Rust SDK for [Pickpoint](https://pickpoint.io).
 //!
 //! - HTTP public API: geocoding, address search, routing, devices, client-tokens
-//! - Realtime tracking: [`tracking`] (WebSocket by default, gRPC supported)
+//! - Live GPS: [`tracking`] (WebSocket, `tracking.v2`)
 
 #![allow(missing_docs)]
 

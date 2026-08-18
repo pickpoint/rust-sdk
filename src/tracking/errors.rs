@@ -1,6 +1,7 @@
 use std::fmt;
 
-use crate::tracking::v2::{Error as WireError, ErrorCode};
+use crate::tracking::cmd::ServerEvt;
+use crate::tracking::types::ErrorCode;
 
 /// Typed tracking protocol / SDK error.
 #[derive(Debug, Clone)]
@@ -9,6 +10,8 @@ pub struct Error {
     pub code: ErrorCode,
     /// Human-readable message.
     pub message: String,
+    pub track_uid: Option<String>,
+    pub retry_after_ms: Option<u32>,
 }
 
 impl fmt::Display for Error {
@@ -28,25 +31,37 @@ pub fn new_error(code: ErrorCode, message: impl Into<String>) -> Error {
     Error {
         code,
         message: message.into(),
+        track_uid: None,
+        retry_after_ms: None,
     }
 }
 
-pub(crate) fn error_from_wire(err: Option<&WireError>) -> Error {
-    match err {
-        Some(e) => {
-            let code = ErrorCode::try_from(e.code).unwrap_or(ErrorCode::Invalid);
-            new_error(code, e.message.clone())
-        }
-        None => new_error(ErrorCode::Invalid, "unknown error"),
+pub(crate) fn error_from_evt(evt: &ServerEvt) -> Error {
+    match evt {
+        ServerEvt::Error {
+            code,
+            message,
+            track_uid,
+            retry_after_ms,
+        } => Error {
+            code: *code,
+            message: message.clone(),
+            track_uid: track_uid.clone(),
+            retry_after_ms: *retry_after_ms,
+        },
+        _ => new_error(ErrorCode::Invalid, "unknown error"),
     }
 }
 
 /// Fatal resume errors that clear the local track.
+/// FENCED / TRY_AGAIN retry Resume. UNAUTHORIZED is a role error.
 pub fn is_fatal_resume_error(code: ErrorCode) -> bool {
-    matches!(
-        code,
-        ErrorCode::TrackNotFound | ErrorCode::Fenced | ErrorCode::Auth | ErrorCode::Unauthorized
-    )
+    matches!(code, ErrorCode::TrackNotFound | ErrorCode::Auth)
+}
+
+/// Retry Resume (do not TrackStart).
+pub fn is_retry_resume_error(code: ErrorCode) -> bool {
+    matches!(code, ErrorCode::Fenced | ErrorCode::TryAgain)
 }
 
 /// Auth-related wire codes.

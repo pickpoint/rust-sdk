@@ -7,7 +7,7 @@ Official Rust SDK for [Pickpoint](https://pickpoint.io) — a geolocation platfo
 | **Geocoding** | Address ↔ coordinates (forward, reverse, place lookup) |
 | **Address search** | Typeahead / autocomplete for address inputs |
 | **Routing** | Routes, matrices, optimized multi-stop, elevation |
-| **Device tracking** | Register devices over HTTP; stream live GPS over WebSocket / gRPC |
+| **Device tracking** | Register devices over HTTP; stream live GPS over WebSocket |
 
 Built for maps, delivery, logistics, and anything that needs places, routes, or live location. Data is OpenStreetMap-backed; HTTP responses are plain JSON / GeoJSON. Docs: [pickpoint.io/docs](https://pickpoint.io/docs).
 
@@ -16,8 +16,7 @@ Built for maps, delivery, logistics, and anything that needs places, routes, or 
 | Module | Import | Role |
 |--------|--------|------|
 | root | `pickpoint` | HTTP: geocode, search, routing, devices, client-tokens |
-| [`tracking`](#tracking) | `pickpoint::tracking` | Realtime tracks (WebSocket by default, gRPC supported) |
-| `tracking::v2` | `pickpoint::tracking::v2` | Generated protobuf (`tracking.v2`) |
+| [`tracking`](#tracking) | `pickpoint::tracking` | Live GPS over WebSocket (`tracking.v2`) |
 
 Apache-2.0. Go sibling: [`github.com/pickpoint/go-sdk`](https://github.com/pickpoint/go-sdk). JS sibling: [`@pickpoint/sdk`](https://github.com/pickpoint/pickpoint-js). Wire schema: [`pickpoint-proto`](https://github.com/pickpoint/pickpoint-proto).
 
@@ -25,13 +24,6 @@ Apache-2.0. Go sibling: [`github.com/pickpoint/go-sdk`](https://github.com/pickp
 [dependencies]
 pickpoint = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-```
-
-```
-rust-sdk/
-  src/                 # HTTP client (root modules)
-  src/tracking/        # tracking session client
-  src/tracking/v2/     # protobuf stubs
 ```
 
 ---
@@ -173,75 +165,72 @@ match pp.devices().get("uid").await {
 
 ## Tracking
 
-Realtime publisher / listener over **binary WebSocket** (`tracking.v2.proto` subprotocol). **gRPC** via `Transport::Grpc`.
+Live GPS is a **separate** WebSocket session: `wss://tracking.pickpoint.io/v2/ws`, subprotocol `tracking.v2`. It is not `pickpoint::Client` (that one is HTTP).
+
+A dropped socket is not a new trip. The SDK reconnects and **Resumes** the same `track_uid`.
+
+First `publish` starts the trip if none is live. `close` sends `TrackStop` then hangs up. Call `start_track` only to supersede (new order / `TRACK_NOT_FOUND`) or to set a route.
+
+### Device (publisher)
 
 ```rust
-use pickpoint::tracking::{self, DeviceAuth};
-use pickpoint::tracking::v2::LatLng;
+use pickpoint::tracking::{self, DeviceAuth, LatLng};
 
 #[tokio::main]
 async fn main() -> Result<(), tracking::Error> {
-    let client = tracking::connect(tracking::Config {
-        endpoint: "wss://tracking.pickpoint.io".into(), // local: "ws://127.0.0.1:3100"
+    let session = tracking::connect(tracking::Config {
+        endpoint: "wss://tracking.pickpoint.io".into(), // host; SDK appends /v2/ws
         device: Some(DeviceAuth {
-            client_id: device_uid,
+            client_id: device_uid,     // from devices.create — not the HTTP API key
             client_secret: device_secret,
         }),
         ..Default::default()
     })
     .await?;
 
-    let track_uid = client
-        .start_track(
-            Some(LatLng {
-                latitude: 55.75,
-                longitude: 37.61,
-                ..Default::default()
-            }),
-            vec![],
-        )
-        .await?;
-    let _ = track_uid;
-
-    let (seq, ok) = client
-        .publish(LatLng {
-            latitude: 55.76,
-            longitude: 37.62,
-            ..Default::default()
-        })
-        .await;
-    let _ = (seq, ok); // managed client_seq; ok=false if rate-limited locally
-
-    client.stop_track(None).await?;
-    client.close().await?;
+    session.publish(LatLng::new(55.75, 37.61)).await; // TrackStart if idle, then GPS
+    session.close().await?; // TrackStop + hang up
     Ok(())
 }
 ```
 
-### Auth modes
+### Listener (dashboard)
 
-| Config | Role |
-|--------|------|
-| `device: Some(DeviceAuth { … })` | Publisher (device) |
-| `listener: Some(ListenerAuth { … })` | Dashboard / subscriber JWT |
+The JWT is the **client-token** `access_token` — same one as HTTP `client_auth`. Mint it on your backend with scope `devices` (API key never goes in the dashboard).
 
-Exactly one of `device` / `listener` is required.
+```rust
+use pickpoint::{mint_client_tokens, Config};
+use pickpoint::tracking::{self, ListenerAuth, ServerEvt};
 
-### Main methods
+let pair = mint_client_tokens(
+    &Config::with_api_key(std::env::var("PICKPOINT_API_KEY").unwrap()),
+    &["devices".into()],
+    Some(600),
+)
+.await?;
 
-| Method | Purpose |
-|--------|---------|
-| `start_track` / `start_track_meta` | Open a track; returns `track_uid` |
-| `publish` | Point on active track (managed `client_seq`); capped at **50 Hz** |
-| `resume` | Manual resume; auto-reconnect also resumes |
-| `stop_track` | End track |
-| `send_event` | Opaque event ≤4 KiB; capped at **1 Hz** |
-| `subscribe` | Listener: subscribe to a device UID |
-| `recv` | Next `ServerMsg` |
-| `recv_command` / `ack_command` | Inbound commands |
-| `close` | Tear down session |
+let session = tracking::connect(tracking::Config {
+    endpoint: "wss://tracking.pickpoint.io".into(),
+    listener: Some(ListenerAuth {
+        access_token: pair.access_token,
+    }),
+    subscribe: vec![device_uid],
+    ..Default::default()
+})
+.await?;
 
-Limits enforced client-side: `MAX_PUBLISH_HZ = 50`, `MAX_EVENT_BYTES = 4 KiB`, `MAX_EVENT_HZ = 1`.
+loop {
+    match session.recv().await? {
+        ServerEvt::LocationAdded { point, .. } => { // live fan-out; publisher never sees Loc
+            println!("{} {}", point.latitude, point.longitude);
+        }
+        ServerEvt::Error { message, .. } => eprintln!("{message}"),
+        _ => {}
+    }
+}
+```
+
+Wire format: [`pickpoint-proto`](https://github.com/pickpoint/pickpoint-proto).
 
 ---
 
@@ -275,10 +264,3 @@ git push origin v2.1.0
 ```
 
 crates.io Trusted Publishing must match this workflow: repo `rust-sdk`, workflow `release.yml` (leave Environment empty).
-
-Protobuf stubs under `src/tracking/v2` are generated from [`pickpoint-proto`](https://github.com/pickpoint/pickpoint-proto) by `build.rs` when the sibling checkout is present; otherwise committed stubs are used. Regenerate:
-
-```bash
-# with ../pickpoint-proto available
-cargo build
-```

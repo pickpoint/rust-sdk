@@ -25,7 +25,7 @@ pub fn build_ws_url(cfg: &Config) -> Result<Url, String> {
         other => return Err(format!("tracking: unsupported scheme {other:?}")),
     }
     let path = if cfg.ws_path.is_empty() {
-        "/v2/tracking/ws"
+        crate::tracking::codec::DEFAULT_WS_PATH
     } else {
         cfg.ws_path.as_str()
     };

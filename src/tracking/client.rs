@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,26 +7,25 @@ use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
-use tonic::Request;
 
 use crate::tracking::backoff::{new_backoff, next_delay, reset_backoff, BackoffState};
-use crate::tracking::codec::{decode_server_msg, encode_client_msg, stamp_lat_lng, stamp_lat_lngs};
-use crate::tracking::errors::{
-    error_from_wire, is_auth_error, is_fatal_resume_error, new_error, Error,
+use crate::tracking::cmd::{ClientCmd, ServerEvt};
+use crate::tracking::codec::{
+    decode_server_evt, encode_client_cmd, encode_loc_frames, stamp_lat_lng, strip_live_time,
 };
+use crate::tracking::errors::{
+    error_from_evt, is_auth_error, is_fatal_resume_error, is_retry_resume_error, new_error, Error,
+};
+use crate::tracking::filter::NoiseFilter;
 use crate::tracking::queue::OfflineQueue;
 use crate::tracking::rate::{can_accept_publish, next_publish_allowed_at};
-use crate::tracking::url::build_ws_url;
-use crate::tracking::v2::tracking_client::TrackingClient;
-use crate::tracking::v2::{
-    client_msg, server_msg, ClientMsg, Command, CommandAck, CommandAckStatus, Event, LatLng,
-    LocationAdd, LocationBatch, Relocate, Resume, ServerMsg, Subscribe, TrackStart, TrackStop,
+use crate::tracking::types::{
+    Command, CommandAckStatus, ErrorCode, LatLng, Relocate, PROTOCOL_VERSION,
 };
+use crate::tracking::url::build_ws_url;
 
 /// WebSocket subprotocol.
-pub const SUBPROTOCOL: &str = "tracking.v2.proto";
+pub const SUBPROTOCOL: &str = crate::tracking::codec::SUBPROTOCOL;
 /// Hard cap for Publish calls (points per second).
 pub const MAX_PUBLISH_HZ: u32 = 50;
 /// Minimum gap between accepted points.
@@ -38,14 +37,12 @@ pub const MAX_EVENT_HZ: u32 = 1;
 /// Minimum gap between events.
 pub const MIN_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Edge protocol selection.
+/// WebSocket `tracking.v2`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Transport {
-    /// Binary protobuf on `/v2/tracking/ws` (default).
+    /// Binary frames on `/v2/ws` (default).
     #[default]
     Ws,
-    /// gRPC bidi session for mesh/agents.
-    Grpc,
 }
 
 /// Connection state machine.
@@ -104,17 +101,17 @@ pub type RefreshAuthFn = Arc<
 /// Opens a session against a Pickpoint tracking endpoint.
 #[derive(Clone)]
 pub struct Config {
-    /// WS: `ws://host:3100`, `wss://…`, or `host:3100`. gRPC: `host:port`.
+    /// Host, e.g. `wss://tracking.pickpoint.io` (SDK appends `/v2/ws`).
     pub endpoint: String,
-    /// Transport (default WS).
+    /// Always WebSocket (`tracking.v2`).
     pub transport: Transport,
     /// Device publisher auth.
     pub device: Option<DeviceAuth>,
     /// Listener auth.
     pub listener: Option<ListenerAuth>,
-    /// WS path (default `/v2/tracking/ws`).
+    /// WS path (default `/v2/ws` when empty).
     pub ws_path: String,
-    /// Disable auto-reconnect (WS only).
+    /// Disable auto-reconnect.
     pub disable_reconnect: bool,
     /// Reconnect min delay.
     pub reconnect_min_delay: Duration,
@@ -128,6 +125,8 @@ pub struct Config {
     pub max_queue_size: usize,
     /// Hello timeout (default 10s).
     pub hello_timeout: Duration,
+    /// Listener: subscribe these device UIDs after Hello (and again after reconnect).
+    pub subscribe: Vec<String>,
 }
 
 impl Default for Config {
@@ -145,12 +144,13 @@ impl Default for Config {
             refresh_auth: None,
             max_queue_size: 10_000,
             hello_timeout: Duration::from_secs(10),
+            subscribe: Vec::new(),
         }
     }
 }
 
 enum Outbound {
-    Msg(ClientMsg),
+    Bin(Vec<u8>),
     Close,
 }
 
@@ -170,42 +170,46 @@ struct Inner {
     cfg: Config,
     state: ConnectionState,
     track_uid: String,
-    client_seq: u64,
+    last_assigned_seq: u64,
     last_acked_seq: u64,
     queue: OfflineQueue,
+    filter: NoiseFilter,
+    /// Bound after TrackStarted / ResumeOk on this socket.
+    session_ready: bool,
     backoff: BackoffState,
     next_publish_at: Instant,
     next_event_at: Instant,
     subscriptions: HashSet<String>,
+    sub_by_device: HashMap<String, u8>,
+    device_by_sub: HashMap<u8, String>,
     intentional: bool,
     dial_gen: u64,
     out_tx: Option<mpsc::UnboundedSender<Outbound>>,
     start_wait: Option<PendingStart>,
     stop_wait: Option<PendingStop>,
     resume_wait: Option<PendingResume>,
+    /// TrackStart sent, waiting for TrackStarted (auto-start or explicit).
+    starting: bool,
 }
 
 /// Tracking session (device or listener).
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Mutex<Inner>>,
-    recv_tx: mpsc::Sender<ServerMsg>,
-    recv_rx: Arc<Mutex<mpsc::Receiver<ServerMsg>>>,
+    recv_tx: mpsc::Sender<ServerEvt>,
+    recv_rx: Arc<Mutex<mpsc::Receiver<ServerEvt>>>,
     cmd_tx: mpsc::Sender<Command>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<Command>>>,
 }
 
-/// Connect opens a tracking session (WS binary protobuf by default).
+/// Connect opens a tracking session (binary `tracking.v2`).
 pub async fn connect(cfg: Config) -> Result<Client, Error> {
     if cfg.endpoint.is_empty() {
-        return Err(new_error(
-            crate::tracking::v2::ErrorCode::Invalid,
-            "Endpoint is required",
-        ));
+        return Err(new_error(ErrorCode::Invalid, "Endpoint is required"));
     }
     if cfg.device.is_none() && cfg.listener.is_none() {
         return Err(new_error(
-            crate::tracking::v2::ErrorCode::Invalid,
+            ErrorCode::Invalid,
             "Device or Listener auth is required",
         ));
     }
@@ -216,6 +220,7 @@ pub async fn connect(cfg: Config) -> Result<Client, Error> {
 
     let (recv_tx, recv_rx) = mpsc::channel(64);
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
+    let subscriptions: HashSet<String> = cfg.subscribe.iter().cloned().collect();
 
     let client = Client {
         inner: Arc::new(Mutex::new(Inner {
@@ -225,20 +230,25 @@ pub async fn connect(cfg: Config) -> Result<Client, Error> {
                 cfg.reconnect_max_attempts,
             ),
             queue: OfflineQueue::new(cfg.max_queue_size),
+            filter: NoiseFilter::new(),
             cfg,
             state: ConnectionState::Connecting,
             track_uid: String::new(),
-            client_seq: 0,
+            last_assigned_seq: 0,
             last_acked_seq: 0,
+            session_ready: false,
             next_publish_at: Instant::now(),
             next_event_at: Instant::now(),
-            subscriptions: HashSet::new(),
+            subscriptions,
+            sub_by_device: HashMap::new(),
+            device_by_sub: HashMap::new(),
             intentional: false,
             dial_gen: 0,
             out_tx: None,
             start_wait: None,
             stop_wait: None,
             resume_wait: None,
+            starting: false,
         })),
         recv_tx,
         recv_rx: Arc::new(Mutex::new(recv_rx)),
@@ -246,20 +256,7 @@ pub async fn connect(cfg: Config) -> Result<Client, Error> {
         cmd_rx: Arc::new(Mutex::new(cmd_rx)),
     };
 
-    let transport = {
-        let g = client.inner.lock().await;
-        g.cfg.transport
-    };
-    match transport {
-        Transport::Grpc => {
-            client.connect_grpc().await?;
-            let mut g = client.inner.lock().await;
-            g.state = ConnectionState::Open;
-        }
-        Transport::Ws => {
-            client.dial(false).await?;
-        }
-    }
+    client.dial(false).await?;
     Ok(client)
 }
 
@@ -276,7 +273,7 @@ impl Client {
 
     /// Last assigned publish sequence.
     pub async fn client_seq(&self) -> u64 {
-        self.inner.lock().await.client_seq
+        self.inner.lock().await.last_assigned_seq
     }
 
     /// Highest server-acked client sequence.
@@ -300,6 +297,7 @@ impl Client {
         let (cfg, gen) = {
             let mut g = self.inner.lock().await;
             g.dial_gen += 1;
+            g.session_ready = false;
             if matches!(
                 g.state,
                 ConnectionState::Open | ConnectionState::Reconnecting
@@ -311,76 +309,69 @@ impl Client {
             (g.cfg.clone(), g.dial_gen)
         };
 
-        let url = build_ws_url(&cfg)
-            .map_err(|e| new_error(crate::tracking::v2::ErrorCode::Invalid, e))?;
+        let url = build_ws_url(&cfg).map_err(|e| new_error(ErrorCode::Invalid, e))?;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = url.as_str().into_client_request().map_err(|e| {
-            new_error(
-                crate::tracking::v2::ErrorCode::Invalid,
-                format!("ws request: {e}"),
-            )
+            new_error(ErrorCode::Invalid, format!("ws request: {e}"))
         })?;
         request.headers_mut().insert(
             "Sec-WebSocket-Protocol",
-            http::HeaderValue::from_static(SUBPROTOCOL),
+            http::HeaderValue::from_static(crate::tracking::codec::SUBPROTOCOL),
         );
 
-        let (ws, _) = connect_async(request).await.map_err(|e| {
-            new_error(
-                crate::tracking::v2::ErrorCode::TryAgain,
-                format!("ws dial: {e}"),
-            )
-        })?;
+        let (ws, _) = connect_async(request)
+            .await
+            .map_err(|e| new_error(ErrorCode::TryAgain, format!("ws dial: {e}")))?;
 
         let (mut write, mut read) = ws.split();
 
-        // Hello
         let hello_timeout = cfg.hello_timeout;
         let first = tokio::time::timeout(hello_timeout, read.next())
             .await
-            .map_err(|_| new_error(crate::tracking::v2::ErrorCode::TryAgain, "hello timeout"))?
-            .ok_or_else(|| {
-                new_error(
-                    crate::tracking::v2::ErrorCode::TryAgain,
-                    "connection closed before hello",
-                )
-            })?
-            .map_err(|e| {
-                new_error(
-                    crate::tracking::v2::ErrorCode::TryAgain,
-                    format!("ws read: {e}"),
-                )
-            })?;
+            .map_err(|_| new_error(ErrorCode::TryAgain, "hello timeout"))?
+            .ok_or_else(|| new_error(ErrorCode::TryAgain, "connection closed before hello"))?
+            .map_err(|e| new_error(ErrorCode::TryAgain, format!("ws read: {e}")))?;
 
         let data = match first {
             Message::Binary(b) => b,
             other => {
                 return Err(new_error(
-                    crate::tracking::v2::ErrorCode::Invalid,
+                    ErrorCode::Invalid,
                     format!("expected binary hello, got {other:?}"),
                 ));
             }
         };
-        let msg = decode_server_msg(&data).map_err(|e| {
-            new_error(
-                crate::tracking::v2::ErrorCode::Invalid,
-                format!("decode hello: {e}"),
-            )
-        })?;
+        let msg = decode_server_evt(&data)
+            .map_err(|e| new_error(ErrorCode::Invalid, format!("decode hello: {e}")))?;
 
-        match msg.body {
-            Some(server_msg::Body::Hello(_)) => {}
-            Some(server_msg::Body::Relocate(rel)) => {
-                return self.handle_relocate(rel, send_resume).await;
+        match msg {
+            Some(ServerEvt::Hello { version, .. }) => {
+                if version != PROTOCOL_VERSION {
+                    return Err(new_error(
+                        ErrorCode::Invalid,
+                        format!("unsupported hello version {version}"),
+                    ));
+                }
             }
-            Some(server_msg::Body::Error(err)) => {
-                return Err(error_from_wire(Some(&err)));
+            Some(ServerEvt::Relocate {
+                endpoint,
+                retry_after_ms,
+            }) => {
+                return self
+                    .handle_relocate(
+                        Relocate {
+                            endpoint,
+                            retry_after_ms,
+                        },
+                        send_resume,
+                    )
+                    .await;
+            }
+            Some(evt @ ServerEvt::Error { .. }) => {
+                return Err(error_from_evt(&evt));
             }
             _ => {
-                return Err(new_error(
-                    crate::tracking::v2::ErrorCode::Invalid,
-                    "expected hello",
-                ));
+                return Err(new_error(ErrorCode::Invalid, "expected hello"));
             }
         }
 
@@ -388,24 +379,17 @@ impl Client {
         {
             let mut g = self.inner.lock().await;
             if gen != g.dial_gen || g.intentional {
-                return Err(new_error(
-                    crate::tracking::v2::ErrorCode::Invalid,
-                    "dial superseded",
-                ));
+                return Err(new_error(ErrorCode::Invalid, "dial superseded"));
             }
             g.out_tx = Some(out_tx);
             g.state = ConnectionState::Open;
             reset_backoff(&mut g.backoff);
         }
 
-        let this = self.clone();
         tokio::spawn(async move {
             while let Some(out) = out_rx.recv().await {
                 match out {
-                    Outbound::Msg(msg) => {
-                        let Ok(buf) = encode_client_msg(&msg) else {
-                            continue;
-                        };
+                    Outbound::Bin(buf) => {
                         if write.send(Message::Binary(buf.into())).await.is_err() {
                             break;
                         }
@@ -422,11 +406,11 @@ impl Client {
         tokio::spawn(async move {
             while let Some(frame) = read.next().await {
                 match frame {
-                    Ok(Message::Binary(b)) => {
-                        if let Ok(msg) = decode_server_msg(&b) {
-                            this_read.dispatch(msg).await;
-                        }
-                    }
+                    Ok(Message::Binary(b)) => match decode_server_evt(&b) {
+                        Ok(Some(msg)) => this_read.dispatch(msg).await,
+                        Ok(None) => {} // unknown server type: ignore
+                        Err(_) => {}
+                    },
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => {}
                 }
@@ -438,7 +422,6 @@ impl Client {
             self.send_resume_and_wait().await?;
         }
         self.resubscribe().await;
-        let _ = this;
         Ok(())
     }
 
@@ -458,137 +441,72 @@ impl Client {
             (send_resume, g.intentional)
         };
         if intentional {
-            return Err(new_error(crate::tracking::v2::ErrorCode::Invalid, "closed"));
+            return Err(new_error(ErrorCode::Invalid, "closed"));
         }
         self.dial_boxed(send_resume).await
     }
 
-    async fn connect_grpc(&self) -> Result<(), Error> {
-        let cfg = self.inner.lock().await.cfg.clone();
-        let channel = Channel::from_shared(format!("http://{}", cfg.endpoint))
-            .map_err(|e| {
-                new_error(
-                    crate::tracking::v2::ErrorCode::Invalid,
-                    format!("grpc endpoint: {e}"),
-                )
-            })?
-            .connect()
-            .await
-            .map_err(|e| {
-                new_error(
-                    crate::tracking::v2::ErrorCode::TryAgain,
-                    format!("grpc dial: {e}"),
-                )
-            })?;
-
-        let mut client = TrackingClient::new(channel);
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Outbound>();
-        let outbound = tokio_stream::wrappers::UnboundedReceiverStream::new(out_rx).filter_map(
-            |o| async move {
-                match o {
-                    Outbound::Msg(m) => Some(m),
-                    Outbound::Close => None,
-                }
-            },
-        );
-
-        let mut request = Request::new(outbound);
-        let md = request.metadata_mut();
-        if let Some(d) = &cfg.device {
-            md.insert(
-                "x-client-id",
-                MetadataValue::try_from(d.client_id.as_str()).map_err(|_| {
-                    new_error(crate::tracking::v2::ErrorCode::Invalid, "bad client-id")
-                })?,
-            );
-            md.insert(
-                "x-client-secret",
-                MetadataValue::try_from(d.client_secret.as_str()).map_err(|_| {
-                    new_error(crate::tracking::v2::ErrorCode::Invalid, "bad client-secret")
-                })?,
-            );
-        } else if let Some(l) = &cfg.listener {
-            let v = format!("Bearer {}", l.access_token);
-            md.insert(
-                "authorization",
-                MetadataValue::try_from(v.as_str()).map_err(|_| {
-                    new_error(crate::tracking::v2::ErrorCode::Invalid, "bad access-token")
-                })?,
-            );
-        }
-
-        let mut stream = client
-            .session(request)
-            .await
-            .map_err(|e| {
-                new_error(
-                    crate::tracking::v2::ErrorCode::TryAgain,
-                    format!("grpc session: {e}"),
-                )
-            })?
-            .into_inner();
-
-        {
-            let mut g = self.inner.lock().await;
-            g.out_tx = Some(out_tx);
-        }
-
-        let this = self.clone();
-        tokio::spawn(async move {
-            while let Ok(Some(msg)) = stream.message().await {
-                this.dispatch(msg).await;
-            }
-        });
-        Ok(())
-    }
-
-    async fn dispatch(&self, msg: ServerMsg) {
-        match msg.body.clone() {
-            Some(server_msg::Body::Relocate(rel)) => {
+    async fn dispatch(&self, msg: ServerEvt) {
+        match &msg {
+            ServerEvt::Relocate {
+                endpoint,
+                retry_after_ms,
+            } => {
+                let rel = Relocate {
+                    endpoint: endpoint.clone(),
+                    retry_after_ms: *retry_after_ms,
+                };
                 let this = self.clone();
                 tokio::spawn(async move {
                     let _ = this.handle_relocate(rel, true).await;
                 });
                 return;
             }
-            Some(server_msg::Body::ResumeOk(ok)) => {
+            ServerEvt::ResumeOk {
+                track_uid,
+                last_acked_seq,
+            } => {
                 let wait = {
                     let mut g = self.inner.lock().await;
-                    if !ok.track_uid.is_empty() {
-                        g.track_uid = ok.track_uid.clone();
+                    if !track_uid.is_empty() {
+                        g.track_uid = track_uid.clone();
                     }
-                    g.last_acked_seq = ok.last_acked_seq;
-                    if g.client_seq < g.last_acked_seq {
-                        g.client_seq = g.last_acked_seq;
+                    g.last_acked_seq = *last_acked_seq;
+                    if g.last_assigned_seq < g.last_acked_seq {
+                        g.last_assigned_seq = g.last_acked_seq;
                     }
-                    let ack = g.last_acked_seq;
-                    g.queue.ack_through(ack);
+                    g.queue.ack_through(*last_acked_seq);
+                    g.session_ready = true;
                     g.resume_wait.take()
                 };
                 self.flush_queue().await;
                 if let Some(w) = wait {
-                    let _ = w.tx.send(Ok(ok.last_acked_seq));
+                    let _ = w.tx.send(Ok(*last_acked_seq));
                 }
             }
-            Some(server_msg::Body::TrackStarted(ts)) => {
+            ServerEvt::TrackStarted { track_uid, .. } => {
                 let wait = {
                     let mut g = self.inner.lock().await;
-                    g.track_uid = ts.track_uid.clone();
-                    g.client_seq = 0;
+                    g.track_uid = track_uid.clone();
+                    g.last_assigned_seq = 0;
                     g.last_acked_seq = 0;
-                    g.queue.clear();
+                    g.session_ready = true;
+                    g.starting = false;
                     g.start_wait.take()
                 };
+                self.flush_queue().await;
                 if let Some(w) = wait {
-                    let _ = w.tx.send(Ok(ts.track_uid));
+                    let _ = w.tx.send(Ok(track_uid.clone()));
                 }
             }
-            Some(server_msg::Body::TrackStopped(ts)) => {
+            ServerEvt::TrackStopped { track_uid } => {
                 let wait = {
                     let mut g = self.inner.lock().await;
-                    if g.track_uid == ts.track_uid {
+                    if g.track_uid == *track_uid {
                         g.track_uid.clear();
                         g.queue.clear();
+                        g.session_ready = false;
+                        g.filter.reset();
                     }
                     g.stop_wait.take()
                 };
@@ -596,41 +514,88 @@ impl Client {
                     let _ = w.tx.send(Ok(()));
                 }
             }
-            Some(server_msg::Body::LocationAdded(loc)) => {
-                let mut g = self.inner.lock().await;
-                if loc.client_seq > g.last_acked_seq {
-                    g.last_acked_seq = loc.client_seq;
+            ServerEvt::Ack { seq } => {
+                {
+                    let mut g = self.inner.lock().await;
+                    if *seq > g.last_acked_seq {
+                        g.last_acked_seq = *seq;
+                    }
+                    g.queue.ack_through(*seq);
                 }
-                g.queue.ack_through(loc.client_seq);
-            }
-            Some(server_msg::Body::Command(cmd)) => {
-                let _ = self.cmd_tx.try_send(cmd);
+                self.flush_queue().await;
                 return;
             }
-            Some(server_msg::Body::Error(err)) => {
-                let e = error_from_wire(Some(&err));
+            ServerEvt::Command {
+                command_id,
+                payload,
+                timestamp_ms,
+            } => {
+                let _ = self.cmd_tx.try_send(Command {
+                    command_id: command_id.clone(),
+                    payload: payload.clone(),
+                    timestamp_ms: *timestamp_ms,
+                });
+                return;
+            }
+            ServerEvt::Error { code, .. } => {
+                let e = error_from_evt(&msg);
                 {
                     let mut g = self.inner.lock().await;
                     if let Some(w) = g.resume_wait.take() {
-                        if is_fatal_resume_error(e.code) {
+                        if is_fatal_resume_error(*code) {
                             g.track_uid.clear();
                             g.queue.clear();
+                            g.session_ready = false;
+                            g.filter.reset();
                         }
                         let _ = w.tx.send(Err(e.clone()));
                     }
                     if let Some(w) = g.start_wait.take() {
+                        g.starting = false;
                         let _ = w.tx.send(Err(e.clone()));
                     }
                     if let Some(w) = g.stop_wait.take() {
                         let _ = w.tx.send(Err(e.clone()));
                     }
+                    if *code == ErrorCode::TrackNotFound && g.resume_wait.is_none() {
+                        g.track_uid.clear();
+                        g.queue.clear();
+                        g.session_ready = false;
+                        g.starting = false;
+                    }
                 }
-                if is_auth_error(e.code) {
+                if is_auth_error(*code) {
                     let this = self.clone();
                     tokio::spawn(async move {
                         this.handle_auth_error().await;
                     });
                 }
+            }
+            ServerEvt::Subscribed { sub, device_uid, .. } => {
+                let mut g = self.inner.lock().await;
+                g.sub_by_device.insert(device_uid.clone(), *sub);
+                g.device_by_sub.insert(*sub, device_uid.clone());
+            }
+            ServerEvt::LocationAdded { sub, .. }
+            | ServerEvt::EventAdded { sub, .. }
+            | ServerEvt::DevicePresence { sub, .. } => {
+                let uid = {
+                    let g = self.inner.lock().await;
+                    g.device_by_sub.get(sub).cloned().unwrap_or_default()
+                };
+                let mut stamped = msg.clone();
+                match &mut stamped {
+                    ServerEvt::LocationAdded { device_uid, .. }
+                    | ServerEvt::EventAdded { device_uid, .. }
+                    | ServerEvt::DevicePresence { device_uid, .. } => {
+                        if device_uid.is_empty() {
+                            *device_uid = uid;
+                        }
+                    }
+                    _ => {}
+                }
+                let _ = self.recv_tx.try_send(stamped);
+                return;
             }
             _ => {}
         }
@@ -662,6 +627,7 @@ impl Client {
                         g.cfg.device = None;
                     }
                     g.dial_gen += 1;
+                    g.session_ready = false;
                     if let Some(tx) = g.out_tx.take() {
                         let _ = tx.send(Outbound::Close);
                     }
@@ -693,18 +659,19 @@ impl Client {
                     return;
                 }
                 g.out_tx = None;
+                g.session_ready = false;
+                g.queue.mark_unsent();
+                g.sub_by_device.clear();
+                g.device_by_sub.clear();
                 if g.intentional {
                     g.state = ConnectionState::Closed;
                     return;
                 }
-                if g.cfg.disable_reconnect || g.cfg.transport == Transport::Grpc {
+                if g.cfg.disable_reconnect {
                     g.state = ConnectionState::Closed;
                     this.reject_pending_locked(
                         &mut g,
-                        new_error(
-                            crate::tracking::v2::ErrorCode::TryAgain,
-                            "connection closed",
-                        ),
+                        new_error(ErrorCode::TryAgain, "connection closed"),
                     );
                     return;
                 }
@@ -717,10 +684,7 @@ impl Client {
                         g.state = ConnectionState::Closed;
                         this.reject_pending_locked(
                             &mut g,
-                            new_error(
-                                crate::tracking::v2::ErrorCode::TryAgain,
-                                "reconnect attempts exhausted",
-                            ),
+                            new_error(ErrorCode::TryAgain, "reconnect attempts exhausted"),
                         );
                         return;
                     }
@@ -751,83 +715,138 @@ impl Client {
 
     async fn resubscribe(&self) {
         let subs: Vec<String> = {
-            let g = self.inner.lock().await;
+            let mut g = self.inner.lock().await;
+            g.sub_by_device.clear();
+            g.device_by_sub.clear();
             g.subscriptions.iter().cloned().collect()
         };
         for d in subs {
             let _ = self
-                .send(ClientMsg {
-                    body: Some(client_msg::Body::Subscribe(Subscribe {
-                        device_uid: d,
-                        include_events: None,
-                        min_location_interval_ms: 0,
-                    })),
+                .send_cmd(ClientCmd::Subscribe {
+                    device_uid: d,
+                    include_events: true,
+                    min_location_interval_ms: 0,
                 })
                 .await;
         }
     }
 
     async fn send_resume_and_wait(&self) -> Result<(), Error> {
-        let (uid, seq, rx) = {
-            let mut g = self.inner.lock().await;
-            if g.track_uid.is_empty() {
-                return Ok(());
-            }
-            let (tx, rx) = oneshot::channel();
-            g.resume_wait = Some(PendingResume { tx });
-            (g.track_uid.clone(), g.client_seq, rx)
-        };
-        self.send(ClientMsg {
-            body: Some(client_msg::Body::Resume(Resume {
+        loop {
+            let (uid, seq, rx) = {
+                let mut g = self.inner.lock().await;
+                if g.track_uid.is_empty() {
+                    return Ok(());
+                }
+                let (tx, rx) = oneshot::channel();
+                g.resume_wait = Some(PendingResume { tx });
+                (g.track_uid.clone(), g.last_assigned_seq, rx)
+            };
+            self.send_cmd(ClientCmd::Resume {
                 track_uid: uid,
                 last_client_seq: seq,
-            })),
-        })
-        .await?;
-        match rx.await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(new_error(
-                crate::tracking::v2::ErrorCode::TryAgain,
-                "resume cancelled",
-            )),
+            })
+            .await?;
+            match rx.await {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) if is_retry_resume_error(e.code) => {
+                    let ms = e.retry_after_ms.unwrap_or(200) as u64;
+                    tokio::time::sleep(Duration::from_millis(ms.max(50))).await;
+                    if self.inner.lock().await.intentional {
+                        return Err(new_error(ErrorCode::Invalid, "closed"));
+                    }
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(new_error(ErrorCode::TryAgain, "resume cancelled"));
+                }
+            }
         }
     }
 
     async fn flush_queue(&self) {
-        let (uid, pending, open) = {
-            let g = self.inner.lock().await;
-            (
-                g.track_uid.clone(),
-                g.queue.peek_all(),
-                g.state == ConnectionState::Open && g.out_tx.is_some(),
-            )
-        };
-        if uid.is_empty() || !open || pending.is_empty() {
-            return;
+        loop {
+            let frames = {
+                let mut g = self.inner.lock().await;
+                if !g.session_ready || g.state != ConnectionState::Open || g.out_tx.is_none() {
+                    return;
+                }
+                let remaining = g.queue.window_remaining();
+                if remaining == 0 {
+                    return;
+                }
+                let mut points: Vec<LatLng> = g
+                    .queue
+                    .unsent_inflight()
+                    .into_iter()
+                    .map(|p| p.point)
+                    .collect();
+                let mut last_seq = g
+                    .queue
+                    .unsent_inflight()
+                    .last()
+                    .map(|p| p.seq)
+                    .unwrap_or(0);
+                if points.is_empty() {
+                    let take = g.queue.staging_len().min(100 * remaining);
+                    if take == 0 {
+                        return;
+                    }
+                    let next_seq = g.last_assigned_seq;
+                    let assigned = g.queue.assign_from_staging(take, next_seq);
+                    if let Some(last) = assigned.last() {
+                        g.last_assigned_seq = last.seq;
+                        last_seq = last.seq;
+                    }
+                    points = assigned.into_iter().map(|p| p.point).collect();
+                } else {
+                    last_seq = g
+                        .queue
+                        .unsent_inflight()
+                        .last()
+                        .map(|p| p.seq)
+                        .unwrap_or(last_seq);
+                }
+                if points.is_empty() {
+                    return;
+                }
+                let encoded = encode_loc_frames(last_seq, &points);
+                let mut out = Vec::new();
+                for frame in encoded {
+                    if g.queue.window_full() {
+                        break;
+                    }
+                    // seq of this frame is bytes 1..5 LE
+                    let seq = if frame.len() >= 5 {
+                        u32::from_le_bytes(frame[1..5].try_into().unwrap()) as u64
+                    } else {
+                        last_seq
+                    };
+                    g.queue.record_frame(seq);
+                    out.push(frame);
+                    if out.len() >= remaining {
+                        break;
+                    }
+                }
+                out
+            };
+            if frames.is_empty() {
+                return;
+            }
+            for frame in frames {
+                if self.send_bin(frame).await.is_err() {
+                    return;
+                }
+            }
         }
-        let last = pending.last().map(|p| p.seq).unwrap_or(0);
-        let points: Vec<LatLng> = pending.into_iter().map(|p| p.point).collect();
-        let _ = self
-            .send(ClientMsg {
-                body: Some(client_msg::Body::LocationBatch(LocationBatch {
-                    track_uid: uid,
-                    client_seq: last,
-                    points: stamp_lat_lngs(points),
-                })),
-            })
-            .await;
     }
 
     /// Next server message (LocationAdded, Subscribed, …). Commands go to [`Self::recv_command`].
-    pub async fn recv(&self) -> Result<ServerMsg, Error> {
+    pub async fn recv(&self) -> Result<ServerEvt, Error> {
         let mut rx = self.recv_rx.lock().await;
-        rx.recv().await.ok_or_else(|| {
-            new_error(
-                crate::tracking::v2::ErrorCode::Invalid,
-                "receive channel closed",
-            )
-        })
+        rx.recv()
+            .await
+            .ok_or_else(|| new_error(ErrorCode::Invalid, "receive channel closed"))
     }
 
     /// Next server→device Command inject.
@@ -843,30 +862,28 @@ impl Client {
         status: CommandAckStatus,
         message: Option<String>,
     ) -> Result<(), Error> {
-        self.send(ClientMsg {
-            body: Some(client_msg::Body::CommandAck(CommandAck {
-                command_id: command_id.into(),
-                status: status as i32,
-                message,
-            })),
+        self.send_cmd(ClientCmd::CommandAck {
+            command_id: command_id.into(),
+            status,
+            message,
         })
         .await
     }
 
-    /// Write a client message on the session.
-    pub async fn send(&self, msg: ClientMsg) -> Result<(), Error> {
+    async fn send_bin(&self, buf: Vec<u8>) -> Result<(), Error> {
         let g = self.inner.lock().await;
         if g.state == ConnectionState::Closed && g.intentional {
-            return Err(new_error(crate::tracking::v2::ErrorCode::Invalid, "closed"));
+            return Err(new_error(ErrorCode::Invalid, "closed"));
         }
         let Some(tx) = &g.out_tx else {
-            return Err(new_error(
-                crate::tracking::v2::ErrorCode::TryAgain,
-                "socket not open",
-            ));
+            return Err(new_error(ErrorCode::TryAgain, "socket not open"));
         };
-        tx.send(Outbound::Msg(msg))
-            .map_err(|_| new_error(crate::tracking::v2::ErrorCode::TryAgain, "socket not open"))
+        tx.send(Outbound::Bin(buf))
+            .map_err(|_| new_error(ErrorCode::TryAgain, "socket not open"))
+    }
+
+    async fn send_cmd(&self, cmd: ClientCmd) -> Result<(), Error> {
+        self.send_bin(encode_client_cmd(&cmd)).await
     }
 
     /// Start a track; waits for `track_started`.
@@ -889,110 +906,155 @@ impl Client {
         {
             let mut g = self.inner.lock().await;
             g.start_wait = Some(PendingStart { tx });
+            g.starting = true;
+            g.queue.clear();
+            g.last_assigned_seq = 0;
+            g.last_acked_seq = 0;
+            g.session_ready = false;
+            g.filter.reset();
+            if let Some(ref p) = loc {
+                g.filter.seed(stamp_lat_lng(p.clone()));
+            }
         }
         let location = loc.map(stamp_lat_lng);
         if let Err(e) = self
-            .send(ClientMsg {
-                body: Some(client_msg::Body::TrackStart(TrackStart {
-                    location,
-                    route: stamp_lat_lngs(route),
-                    metadata,
-                })),
+            .send_cmd(ClientCmd::TrackStart {
+                location,
+                route: crate::tracking::codec::stamp_lat_lngs(route),
+                metadata,
             })
             .await
         {
             let mut g = self.inner.lock().await;
             g.start_wait = None;
+            g.starting = false;
             return Err(e);
         }
         match rx.await {
             Ok(r) => r,
-            Err(_) => Err(new_error(
-                crate::tracking::v2::ErrorCode::TryAgain,
-                "start cancelled",
-            )),
+            Err(_) => Err(new_error(ErrorCode::TryAgain, "start cancelled")),
         }
     }
 
     /// Manual resume; auto-reconnect also resumes.
     pub async fn resume(&self, track_uid: String, last_client_seq: u64) -> Result<u64, Error> {
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut g = self.inner.lock().await;
-            g.track_uid = track_uid.clone();
-            g.client_seq = last_client_seq;
-            g.resume_wait = Some(PendingResume { tx });
-        }
-        if let Err(e) = self
-            .send(ClientMsg {
-                body: Some(client_msg::Body::Resume(Resume {
-                    track_uid,
+        loop {
+            let rx = {
+                let mut g = self.inner.lock().await;
+                g.track_uid = track_uid.clone();
+                g.last_assigned_seq = last_client_seq;
+                let (tx, rx) = oneshot::channel();
+                g.resume_wait = Some(PendingResume { tx });
+                rx
+            };
+            if let Err(e) = self
+                .send_cmd(ClientCmd::Resume {
+                    track_uid: track_uid.clone(),
                     last_client_seq,
-                })),
-            })
-            .await
-        {
-            let mut g = self.inner.lock().await;
-            g.resume_wait = None;
-            return Err(e);
-        }
-        match rx.await {
-            Ok(r) => r,
-            Err(_) => Err(new_error(
-                crate::tracking::v2::ErrorCode::TryAgain,
-                "resume cancelled",
-            )),
+                })
+                .await
+            {
+                let mut g = self.inner.lock().await;
+                g.resume_wait = None;
+                return Err(e);
+            }
+            match rx.await {
+                Ok(Ok(seq)) => return Ok(seq),
+                Ok(Err(e)) if is_retry_resume_error(e.code) => {
+                    let ms = e.retry_after_ms.unwrap_or(200) as u64;
+                    tokio::time::sleep(Duration::from_millis(ms.max(50))).await;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(new_error(ErrorCode::TryAgain, "resume cancelled")),
+            }
         }
     }
 
-    /// Publish a location on the active track (managed clientSeq).
-    /// Returns `(seq, accepted)`; when over rate limit, `accepted` is false.
+    /// Publish a GPS sample.
+    ///
+    /// If there is no live track, this sends `TrackStart` (the point is the start
+    /// location). Further samples are filtered and staged until `TrackStarted`.
+    /// Returns `(seq, accepted)`.
     pub async fn publish(&self, point: LatLng) -> (u64, bool) {
-        let (seq, uid, pt, open) = {
+        let start = {
             let mut g = self.inner.lock().await;
-            if g.track_uid.is_empty() {
+            if g.track_uid.is_empty() && !g.starting {
+                g.starting = true;
+                g.queue.clear();
+                g.last_assigned_seq = 0;
+                g.last_acked_seq = 0;
+                g.session_ready = false;
+                g.filter.reset();
+                g.filter.seed(stamp_lat_lng(point.clone()));
+                Some(stamp_lat_lng(point.clone()))
+            } else {
+                None
+            }
+        };
+        if let Some(location) = start {
+            if let Err(_) = self
+                .send_cmd(ClientCmd::TrackStart {
+                    location: Some(location),
+                    route: vec![],
+                    metadata: Vec::new(),
+                })
+                .await
+            {
+                let mut g = self.inner.lock().await;
+                g.starting = false;
                 return (0, false);
             }
+            return (0, true);
+        }
+        let work = {
+            let mut g = self.inner.lock().await;
             let now = Instant::now();
             if !can_accept_publish(g.next_publish_at, now, 1) {
-                return (g.client_seq, false);
+                return (g.last_assigned_seq, false);
             }
             g.next_publish_at = next_publish_allowed_at(g.next_publish_at, now, 1);
-            g.client_seq += 1;
-            let seq = g.client_seq;
-            let uid = g.track_uid.clone();
             let pt = stamp_lat_lng(point);
-            g.queue.enqueue(seq, pt);
-            let open = g.state == ConnectionState::Open && g.out_tx.is_some();
-            (seq, uid, pt, open)
+            let Some(emitted) = g.filter.push(pt) else {
+                return (g.last_assigned_seq, true);
+            };
+            let open = g.session_ready
+                && g.state == ConnectionState::Open
+                && g.out_tx.is_some()
+                && !g.queue.window_full();
+            if !open {
+                g.queue.push_staging(emitted);
+                return (g.last_assigned_seq, true);
+            }
+            g.last_assigned_seq += 1;
+            let seq = g.last_assigned_seq;
+            g.queue.enqueue(seq, emitted.clone());
+            g.queue.record_frame(seq);
+            Some((seq, strip_live_time(emitted)))
         };
-        if open {
+        if let Some((seq, pt)) = work {
             let _ = self
-                .send(ClientMsg {
-                    body: Some(client_msg::Body::LocationAdd(LocationAdd {
-                        track_uid: uid,
-                        client_seq: seq,
-                        point: Some(pt),
-                    })),
+                .send_cmd(ClientCmd::LocationAdd {
+                    track_uid: String::new(),
+                    client_seq: seq,
+                    point: pt,
                 })
                 .await;
+            (seq, true)
+        } else {
+            (0, true)
         }
-        (seq, true)
     }
 
-    /// Stop the active (or given) track.
+    /// Stop the active (or given) track. Idle (no track) is a client no-op.
     pub async fn stop_track(&self, track_uid: Option<String>) -> Result<(), Error> {
+        let local = self.track_uid().await;
         let track_uid = match track_uid {
             Some(u) if !u.is_empty() => u,
             _ => {
-                let u = self.track_uid().await;
-                if u.is_empty() {
-                    return Err(new_error(
-                        crate::tracking::v2::ErrorCode::Invalid,
-                        "no active track",
-                    ));
+                if local.is_empty() {
+                    return Ok(());
                 }
-                u
+                local
             }
         };
         let (tx, rx) = oneshot::channel();
@@ -1001,9 +1063,7 @@ impl Client {
             g.stop_wait = Some(PendingStop { tx });
         }
         if let Err(e) = self
-            .send(ClientMsg {
-                body: Some(client_msg::Body::TrackStop(TrackStop { track_uid })),
-            })
+            .send_cmd(ClientCmd::TrackStop { track_uid })
             .await
         {
             let mut g = self.inner.lock().await;
@@ -1012,10 +1072,7 @@ impl Client {
         }
         match rx.await {
             Ok(r) => r,
-            Err(_) => Err(new_error(
-                crate::tracking::v2::ErrorCode::TryAgain,
-                "stop cancelled",
-            )),
+            Err(_) => Err(new_error(ErrorCode::TryAgain, "stop cancelled")),
         }
     }
 
@@ -1023,15 +1080,15 @@ impl Client {
     pub async fn send_event(&self, payload: Vec<u8>) -> Result<bool, Error> {
         if payload.len() > MAX_EVENT_BYTES {
             return Err(new_error(
-                crate::tracking::v2::ErrorCode::Invalid,
+                ErrorCode::Invalid,
                 "event payload exceeds 4 KiB",
             ));
         }
-        let (uid, open) = {
+        let open = {
             let mut g = self.inner.lock().await;
-            if g.track_uid.is_empty() {
+            if g.track_uid.is_empty() || !g.session_ready {
                 return Err(new_error(
-                    crate::tracking::v2::ErrorCode::Invalid,
+                    ErrorCode::Invalid,
                     "start_track() before send_event()",
                 ));
             }
@@ -1040,10 +1097,7 @@ impl Client {
                 return Ok(false);
             }
             g.next_event_at = now + MIN_EVENT_INTERVAL;
-            (
-                g.track_uid.clone(),
-                g.state == ConnectionState::Open && g.out_tx.is_some(),
-            )
+            g.state == ConnectionState::Open && g.out_tx.is_some()
         };
         if !open {
             return Ok(true);
@@ -1052,44 +1106,62 @@ impl Client {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        self.send(ClientMsg {
-            body: Some(client_msg::Body::Event(Event {
-                track_uid: uid,
-                payload,
-                timestamp_ms: Some(ts),
-            })),
+        self.send_cmd(ClientCmd::Event {
+            track_uid: String::new(),
+            payload,
+            timestamp_ms: Some(ts),
         })
         .await?;
         Ok(true)
     }
 
-    /// Subscribe to a device (listener).
+    /// Subscribe to a device (listener). Include events unless the app opted out
+    /// by using a future options API; this method always sets the include-events flag.
     pub async fn subscribe(&self, device_uid: impl Into<String>) -> Result<(), Error> {
         let device_uid = device_uid.into();
         {
             let mut g = self.inner.lock().await;
             g.subscriptions.insert(device_uid.clone());
         }
-        self.send(ClientMsg {
-            body: Some(client_msg::Body::Subscribe(Subscribe {
-                device_uid,
-                include_events: None,
-                min_location_interval_ms: 0,
-            })),
+        self.send_cmd(ClientCmd::Subscribe {
+            device_uid,
+            include_events: true,
+            min_location_interval_ms: 0,
         })
         .await
     }
 
-    /// End the session.
+    /// Unsubscribe by the `sub` handle from `Subscribed` (looked up by device uid).
+    pub async fn unsubscribe(&self, device_uid: impl Into<String>) -> Result<(), Error> {
+        let device_uid = device_uid.into();
+        let sub = {
+            let mut g = self.inner.lock().await;
+            g.subscriptions.remove(&device_uid);
+            g.sub_by_device.remove(&device_uid)
+        };
+        if let Some(sub) = sub {
+            self.send_cmd(ClientCmd::Unsubscribe { sub }).await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// End the session. Sends `TrackStop` if a track is live, then hangs up.
+    /// Do not Resume afterwards.
     pub async fn close(&self) -> Result<(), Error> {
+        let uid = {
+            let g = self.inner.lock().await;
+            g.track_uid.clone()
+        };
+        if !uid.is_empty() {
+            let _ = self.send_cmd(ClientCmd::TrackStop { track_uid: uid }).await;
+        }
         let tx = {
             let mut g = self.inner.lock().await;
             g.intentional = true;
             g.state = ConnectionState::Closed;
-            self.reject_pending_locked(
-                &mut g,
-                new_error(crate::tracking::v2::ErrorCode::Invalid, "client closed"),
-            );
+            g.session_ready = false;
+            self.reject_pending_locked(&mut g, new_error(ErrorCode::Invalid, "client closed"));
             g.out_tx.take()
         };
         if let Some(tx) = tx {
