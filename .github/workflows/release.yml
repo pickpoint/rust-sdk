@@ -1,13 +1,10 @@
 name: Release
 
 on:
-  # After CI on main — not on the push itself. CI (fmt/clippy/test) and
-  # release used to race; a red clippy still published to crates.io.
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
+  # crates.io Trusted Publishing rejects workflow_run (security). Gate
+  # fmt/clippy/test in this job so they cannot race a publish.
   push:
+    branches: [main]
     tags: ["v*"]
 
 concurrency:
@@ -19,11 +16,11 @@ permissions:
   id-token: write
 
 jobs:
-  # Auto-patch when the commit CI tested is untagged.
+  # Auto-patch on main when HEAD is not already tagged.
   # NOTE: pushes made with GITHUB_TOKEN do not trigger new workflows, so we
   # must publish in this same job (cannot rely on the tag push event).
   release-main:
-    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -32,7 +29,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Skip if release commit or already tagged
@@ -53,10 +49,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.guard.outputs.skip != 'true'
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         if: steps.guard.outputs.skip != 'true'
 
+      - if: steps.guard.outputs.skip != 'true'
+        run: cargo fmt --check
+      - if: steps.guard.outputs.skip != 'true'
+        run: cargo clippy --all-targets -- -D warnings
       - if: steps.guard.outputs.skip != 'true'
         run: cargo test
 
@@ -127,6 +129,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Verify tag matches Cargo.toml
         run: |
@@ -139,6 +143,8 @@ jobs:
           fi
 
       - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
       - name: Skip if version already on crates.io
