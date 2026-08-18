@@ -252,7 +252,7 @@ PICKPOINT_API_KEY=… cargo test --test e2e_geocode_batch -- --nocapture
 ### CI & release
 
 - **PR** → `.github/workflows/ci.yml` (`fmt`, `clippy`, `test`)
-- **Push to `main`** (untagged HEAD) → bump **patch** in `Cargo.toml`, tag `vX.Y.Z`, `cargo publish` (OIDC) + GitHub Release in the same job  
+- **CI on `main` green** (untagged HEAD) → bump **patch** in `Cargo.toml`, tag `vX.Y.Z`, `cargo publish` (OIDC) + GitHub Release in the same job  
   (tag push via `GITHUB_TOKEN` does not start new workflows — publish cannot wait on the tag event)
 - **Manual tag `v*`** (pushed by a human) → publish + GitHub Release
 

@@ -1,8 +1,13 @@
 name: Release
 
 on:
-  push:
+  # After CI on main — not on the push itself. CI (fmt/clippy/test) and
+  # release used to race; a red clippy still published to crates.io.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
+  push:
     tags: ["v*"]
 
 concurrency:
@@ -14,11 +19,11 @@ permissions:
   id-token: write
 
 jobs:
-  # Auto-patch on main when HEAD is not already tagged.
+  # Auto-patch when the commit CI tested is untagged.
   # NOTE: pushes made with GITHUB_TOKEN do not trigger new workflows, so we
   # must publish in this same job (cannot rely on the tag push event).
   release-main:
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -27,6 +32,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Skip if release commit or already tagged

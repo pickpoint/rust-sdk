@@ -590,10 +590,10 @@ impl Client {
                 match &mut stamped {
                     ServerEvt::LocationAdded { device_uid, .. }
                     | ServerEvt::EventAdded { device_uid, .. }
-                    | ServerEvt::DevicePresence { device_uid, .. } => {
-                        if device_uid.is_empty() {
-                            *device_uid = uid;
-                        }
+                    | ServerEvt::DevicePresence { device_uid, .. }
+                        if device_uid.is_empty() =>
+                    {
+                        *device_uid = uid;
                     }
                     _ => {}
                 }
