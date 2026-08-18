@@ -251,8 +251,8 @@ PICKPOINT_API_KEY=… cargo test --test e2e_geocode_batch -- --nocapture
 
 ### CI & release
 
-- **PR** → `.github/workflows/ci.yml` (`fmt`, `clippy`, `test`)
-- **CI on `main` green** (untagged HEAD) → bump **patch** in `Cargo.toml`, tag `vX.Y.Z`, `cargo publish` (OIDC) + GitHub Release in the same job  
+- **PR to `dev`** → `.github/workflows/ci.yml` (`fmt`, `clippy`, `test`)
+- **Merge `dev` → `main`** (untagged HEAD) → bump **patch** in `Cargo.toml`, tag `vX.Y.Z`, `cargo publish` (OIDC) + GitHub Release in the same job  
   (tag push via `GITHUB_TOKEN` does not start new workflows — publish cannot wait on the tag event)
 - **Manual tag `v*`** (pushed by a human) → publish + GitHub Release
 
@@ -264,3 +264,7 @@ git push origin v2.1.0
 ```
 
 crates.io Trusted Publishing must match this workflow: repo `rust-sdk`, workflow `release.yml` (leave Environment empty).
+
+## Contributing
+
+Fork and open a PR against **`dev`**. [CONTRIBUTING.md](CONTRIBUTING.md).
