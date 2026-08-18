@@ -120,10 +120,7 @@ async fn reconnect_track_not_found_clears_cursor() {
     .unwrap();
 
     c.start_track(None, vec![]).await.unwrap();
-    assert_eq!(
-        c.track_uid().await,
-        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-    );
+    assert_eq!(c.track_uid().await, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
 
     let conn = ms.wait_conn(Duration::from_secs(2)).await;
     conn.close().await;
@@ -248,7 +245,12 @@ async fn queue_flush_after_resume() {
     )
     .await;
     ms.wait_msg(
-        |m| matches!(m, ClientCmd::LocationBatch { .. } | ClientCmd::LocationAdd { .. }),
+        |m| {
+            matches!(
+                m,
+                ClientCmd::LocationBatch { .. } | ClientCmd::LocationAdd { .. }
+            )
+        },
         Duration::from_secs(8),
     )
     .await;

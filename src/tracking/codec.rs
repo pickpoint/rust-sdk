@@ -754,11 +754,7 @@ pub fn decode_server_evt(bytes: &[u8]) -> Result<Option<ServerEvt>, DecodeError>
             } else {
                 None
             };
-            let last_seen_ms = if flags & 2 != 0 {
-                Some(r.i64()?)
-            } else {
-                None
-            };
+            let last_seen_ms = if flags & 2 != 0 { Some(r.i64()?) } else { None };
             let route = if flags & 4 != 0 {
                 read_route_abs(&mut r)?
             } else {

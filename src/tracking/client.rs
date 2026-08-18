@@ -311,9 +311,10 @@ impl Client {
 
         let url = build_ws_url(&cfg).map_err(|e| new_error(ErrorCode::Invalid, e))?;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let mut request = url.as_str().into_client_request().map_err(|e| {
-            new_error(ErrorCode::Invalid, format!("ws request: {e}"))
-        })?;
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| new_error(ErrorCode::Invalid, format!("ws request: {e}")))?;
         request.headers_mut().insert(
             "Sec-WebSocket-Protocol",
             http::HeaderValue::from_static(crate::tracking::codec::SUBPROTOCOL),
@@ -571,7 +572,9 @@ impl Client {
                     });
                 }
             }
-            ServerEvt::Subscribed { sub, device_uid, .. } => {
+            ServerEvt::Subscribed {
+                sub, device_uid, ..
+            } => {
                 let mut g = self.inner.lock().await;
                 g.sub_by_device.insert(device_uid.clone(), *sub);
                 g.device_by_sub.insert(*sub, device_uid.clone());
@@ -781,12 +784,7 @@ impl Client {
                     .into_iter()
                     .map(|p| p.point)
                     .collect();
-                let mut last_seq = g
-                    .queue
-                    .unsent_inflight()
-                    .last()
-                    .map(|p| p.seq)
-                    .unwrap_or(0);
+                let mut last_seq = g.queue.unsent_inflight().last().map(|p| p.seq).unwrap_or(0);
                 if points.is_empty() {
                     let take = g.queue.staging_len().min(100 * remaining);
                     if take == 0 {
@@ -992,13 +990,14 @@ impl Client {
             }
         };
         if let Some(location) = start {
-            if let Err(_) = self
+            if self
                 .send_cmd(ClientCmd::TrackStart {
                     location: Some(location),
                     route: vec![],
                     metadata: Vec::new(),
                 })
                 .await
+                .is_err()
             {
                 let mut g = self.inner.lock().await;
                 g.starting = false;
@@ -1062,10 +1061,7 @@ impl Client {
             let mut g = self.inner.lock().await;
             g.stop_wait = Some(PendingStop { tx });
         }
-        if let Err(e) = self
-            .send_cmd(ClientCmd::TrackStop { track_uid })
-            .await
-        {
+        if let Err(e) = self.send_cmd(ClientCmd::TrackStop { track_uid }).await {
             let mut g = self.inner.lock().await;
             g.stop_wait = None;
             return Err(e);
@@ -1079,10 +1075,7 @@ impl Client {
     /// Fan-out opaque payload (≤4 KiB, ≤1 Hz). Returns `(accepted, error)`.
     pub async fn send_event(&self, payload: Vec<u8>) -> Result<bool, Error> {
         if payload.len() > MAX_EVENT_BYTES {
-            return Err(new_error(
-                ErrorCode::Invalid,
-                "event payload exceeds 4 KiB",
-            ));
+            return Err(new_error(ErrorCode::Invalid, "event payload exceeds 4 KiB"));
         }
         let open = {
             let mut g = self.inner.lock().await;

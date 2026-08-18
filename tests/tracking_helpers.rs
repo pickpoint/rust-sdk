@@ -217,10 +217,7 @@ fn golden_frames() {
     });
     assert_eq!(hex::encode(&loc), "04010000000100c03b470340933402");
 
-    let resume = encode_client_cmd(&client_resume(
-        "00112233-4455-6677-8899-aabbccddeeff",
-        45,
-    ));
+    let resume = encode_client_cmd(&client_resume("00112233-4455-6677-8899-aabbccddeeff", 45));
     assert_eq!(
         hex::encode(&resume),
         "0100112233445566778899aabbccddeeff2d000000"

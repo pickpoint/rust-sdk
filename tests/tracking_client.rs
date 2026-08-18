@@ -331,16 +331,25 @@ async fn publish_starts_track_and_close_stops() {
     .unwrap();
 
     c.publish(LatLng::new(55.75, 37.61)).await;
-    ms.wait_msg(|m| matches!(m, ClientCmd::TrackStart { .. }), Duration::from_secs(2))
-        .await;
+    ms.wait_msg(
+        |m| matches!(m, ClientCmd::TrackStart { .. }),
+        Duration::from_secs(2),
+    )
+    .await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while c.track_uid().await.is_empty() {
-        assert!(tokio::time::Instant::now() < deadline, "track_uid after auto-start");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "track_uid after auto-start"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     c.close().await.unwrap();
-    ms.wait_msg(|m| matches!(m, ClientCmd::TrackStop { .. }), Duration::from_secs(2))
-        .await;
+    ms.wait_msg(
+        |m| matches!(m, ClientCmd::TrackStop { .. }),
+        Duration::from_secs(2),
+    )
+    .await;
 }
